@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+source restic-env
+
+print_help() {
+  cat <<EOF
+Usage: start
+Starts the Restic Volumetric process.
+
+Begins by restoring volumes from previous Restic Volumetric backups if
+\$RESTORE_ENABLED=true.
+
+Then sets up a crontab to call "scan" periodically according to \$SCAN_CRON,
+and start crond. "scan" will enable and disable additional cron jobs for each
+volume, as they come online/go offline.
+
+Finally, monitors logs from cron jobs and prints them to stdout.
+
+Environment Variables:
+  RESTORE_ENABLED  If true, restores volumes on start.
+  SCAN_CRON        Specifies cron schedule to run "scan".
+  LOG_LEVEL        Minimum log level to display (default: info).
+EOF
+}
+
+if [ "$#" -ne 0 ]; then
+  print_help
+  exit
+fi
+
+log info "--- STARTING RESTIC VOLUMIZER ---"
+
+if [ "$RESTORE_ENABLED" = "true" ]; then
+  log info "--- RESTORING VOLUMES ---"
+  restore
+fi
+
+trap '\
+  log info "--- STOPPING CRON JOBS ---" \
+  kill $cron_pid 2>/dev/null; \
+  log info "--- STOPPING LOGS ---" \
+  kill $tail_pid 2>/dev/null; \
+  exit 0; \
+' SIGTERM SIGINT
+
+log info "--- PERFORMING INITIAL SCAN ---"
+scan --backup-now
+
+log info "--- STARTING CRON JOBS ---"
+echo "$SCAN_CRON scan >>/app/cron.log 2>&1" > /etc/cron.d/scan-volumes
+crond -f 2>&1 | log -p crond info &
+cron_pid=$!
+
+log info "--- MONITORING LOGS ---"
+touch /app/cron.log
+tail -f /app/cron.log &
+tail_pid=$!
+
+wait $cron_pid $tail_pid
+
+echo "--- RESTIC VOLUMIZER STOPPED ---";
+

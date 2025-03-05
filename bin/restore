@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+node_name=""
+volumes=()
+
+# Function to print help
+print_help() {
+  cat <<EOF
+Usage: restore [--node node_name] [volume...]
+Restore script for Restic backups.
+
+Arguments:
+  --node node_name  If provided, will restore from given node's metadata.
+                    Note: This will have no effect if either are set:
+                      - \$RESTIC_NODE_REPO_ROOT
+                      - \$RESTIC_NODE_META_REPO
+  volume            Optional list of volume names to restore. If not provided,
+                    all volumes will be restored.
+EOF
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --help)
+      print_help
+      exit 0
+      ;;
+    --node)
+      node_name="$2"
+      shift 2
+      ;;
+    *)
+      volumes+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [ -n "$node_name" ]; then
+  export NODE_NAME="$node_name"
+fi
+
+source restic-env
+
+# Restore meta
+log info "Restoring meta ..."
+
+if [ "$META_ENABLED" != "true" ]; then
+  log info "Meta disabled, nothing to restore."
+  exit
+fi
+
+meta_repo="$RESTIC_NODE_META_REPO"
+meta_path="$META_PATH"
+tmp_meta_path="/tmp/restore/meta"
+meta_vol_dir="$META_PATH/volumes"
+
+log info "> Using repo: $meta_repo"
+log debug "> Restoring to: $meta_path"
+log debug "> Using temporary: $tmp_meta_path"
+
+mkdir -p "$tmp_meta_path"
+if restic-cmd "$meta_repo" restore --target "$tmp_meta_path" latest; then
+  log debug "> Moving $tmp_meta_path to $meta_path"
+  rm -rf "$meta_path"
+  mkdir -p "$(dirname "$meta_path")"
+  mv "$tmp_meta_path" "$meta_path"
+else
+  log warn "! Restore failed for meta. If this is your first time running, ignore..."
+  exit
+fi
+
+log info "Successfully restored meta ..."
+
+# Restore volumes
+log info "Restoring volumes ..."
+
+for file in "$meta_vol_dir"/*.json; do
+  # Extract the volume name from the file name
+  vol=$(basename "$file" .json)
+
+  # Skip if volume is not in the list
+  if [ ${#volumes[@]} -gt 0 ] && ! [[ " ${volumes[@]} " =~ " $vol " ]]; then
+    log info "> Skipping volume: $vol"
+    continue
+  fi
+
+  log info "> Restoring volume: $vol"
+
+  # Check if the volume exists in Docker
+  if docker volume inspect "$vol" &>/dev/null; then
+    log info "> Volume alread exists. Skipping..."
+    continue
+  fi
+
+  # Create volume...
+  log info "> Creating Docker volume..."
+  driver=$(jq -r '.Driver' "$file")
+  options=$(jq -r '.Options // {}' "$file" | jq -r 'to_entries[] | "--opt \(.key)=\(.value)"' | xargs)
+  labels=$(jq -r '.Labels // {}' "$file" | jq -r 'to_entries[] | "--label \(.key)=\(.value)"' | xargs)
+
+  if ! docker volume create --name "$vol" --driver "$driver" $options $labels >/dev/null; then
+    log error "! Failed to create volume $vol. Skipping..."
+    continue
+  fi
+
+  # Restore data...
+  info=$(docker volume inspect "$vol" --format json | jq '.[0]')
+  mountpoint=$(jq -r '.Mountpoint' <<< "$info")
+  repo=$(get-volume-label "$info" restic.repo "$RESTIC_REPO_ROOT/$vol")
+  password=$(get-volume-label "$info" restic.password "$RESTIC_PASSWORD")
+  password_file=$(get-volume-label "$info" restic.password.file "$RESTIC_PASSWORD_FILE")
+
+  log info "> Restoring data from repo: $repo"
+  (
+    RESTIC_PASSWORD="$password"
+    RESTIC_PASSWORD_FILE="$password_file"
+
+    if ! restic-cmd "$repo" restore --target "$mountpoint" latest; then
+      log error "! Failed to restore data for $vol. Skipping..."
+    fi
+  )
+
+done
+

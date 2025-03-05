@@ -1,0 +1,254 @@
+#!/bin/bash
+
+set -euo pipefail
+source restic-env
+
+usage() {
+  cat <<EOF
+Usage: update-labels [--label key=value ...] [--overwrite|--append] [--dry-run] volume_name
+
+Duplicates a Docker volume with updated labels.
+
+Arguments:
+  volume_name           Name of the Docker volume to update.
+  --label key=value     New label to apply. Can be specified multiple times.
+  --overwrite           Replace existing labels with new ones (default).
+  --append              Append new labels to existing labels.
+  --dry-run             Show actions without making changes.
+EOF
+}
+
+# Defaults
+mode="overwrite"
+dry_run=false
+new_labels=()
+
+# Must have at least one argument
+if [ $# -eq 0 ]; then
+  usage
+  exit 1
+fi
+
+# Parse command-line arguments
+volume_name=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --help)
+      usage
+      exit 0
+      ;;
+    --label)
+      if [ $# -lt 2 ]; then
+        log error "--label requires an argument in the form key=value"
+        exit 1
+      fi
+      new_labels+=("$2")
+      shift 2
+      ;;
+    --overwrite)
+      mode="overwrite"
+      shift
+      ;;
+    --append)
+      mode="append"
+      shift
+      ;;
+    --dry-run)
+      dry_run=true
+      shift
+      ;;
+    *)
+      if [ -z "$volume_name" ]; then
+        volume_name="$1"
+      else
+        log error "Unrecognized argument: $1"
+        usage
+        exit 1
+      fi
+      shift
+      ;;
+  esac
+done
+
+if [ -z "$volume_name" ]; then
+  log error "Volume name is required."
+  usage
+  exit 1
+fi
+
+log info "Starting update-labels for volume: $volume_name"
+if [ "$dry_run" = true ]; then
+  log info "Dry-run mode enabled. No changes will be made."
+fi
+
+###############################################################################
+# 1. Inspect the volume and extract its info
+###############################################################################
+log info "Inspecting volume: $volume_name"
+volume_info=$(docker volume inspect "$volume_name" --format '{{json .}}')
+if [ -z "$volume_info" ]; then
+  log error "Volume $volume_name not found."
+  exit 1
+fi
+
+# Extract common properties
+mountpoint=$(echo "$volume_info" | jq -r '.Mountpoint')
+driver=$(echo "$volume_info" | jq -r '.Driver')
+existing_labels_json=$(echo "$volume_info" | jq -r '.Labels // {}')
+log debug "Existing labels: $existing_labels_json"
+
+# Build an associative array of the existing labels
+declare -A existing_labels
+for key in $(echo "$existing_labels_json" | jq -r 'keys[]'); do
+  value=$(echo "$existing_labels_json" | jq -r --arg k "$key" '.[$k]')
+  existing_labels["$key"]="$value"
+done
+
+###############################################################################
+# 2. Process new labels and decide whether to overwrite or append
+###############################################################################
+declare -A labels_to_apply
+if [ "$mode" = "overwrite" ]; then
+  for label in "${new_labels[@]}"; do
+    key="${label%%=*}"
+    value="${label#*=}"
+    labels_to_apply["$key"]="$value"
+  done
+else  # Append mode: start with existing labels and override with any new ones
+  for key in "${!existing_labels[@]}"; do
+    labels_to_apply["$key"]="${existing_labels[$key]}"
+  done
+  for label in "${new_labels[@]}"; do
+    key="${label%%=*}"
+    value="${label#*=}"
+    labels_to_apply["$key"]="$value"
+  done
+fi
+
+# Build label options for docker volume create
+label_opts=()
+for key in "${!labels_to_apply[@]}"; do
+  label_opts+=(--label "$key=${labels_to_apply[$key]}")
+done
+
+###############################################################################
+# 3. Loop until no containers are using the volume
+###############################################################################
+while true; do
+  containers=$(docker ps -a -q --filter "volume=$volume_name")
+  if [ -z "$containers" ]; then
+    log info "No running containers are using the volume."
+    break
+  else
+    log error <<EOF
+The following containers are still using the volume:
+
+$(docker ps -a --filter "volume=$volume_name")
+
+Please manually stop and remove these containers.
+
+I'll wait...
+EOF
+
+    if [ "$dry_run" = false ]; then
+      read -rp "Press Enter after stopping/removing containers using the volume..." _
+    else
+      log info "Dry-run: would wait for user to stop containers"
+      break
+    fi
+  fi
+done
+
+###############################################################################
+# 4. Locate the mountpoint and move data to a temporary location
+###############################################################################
+log info "Volume mountpoint: $mountpoint"
+temp_dir=$(mktemp -d)
+log info "Moving data from volume to temporary location: $temp_dir"
+if [ "$dry_run" = false ]; then
+  # Using wildcard; if directory is empty, ignore error.
+  shopt -s dotglob nullglob  # Handle dotfiles
+  mv "$mountpoint"/* "$mountpoint"/.* "$temp_dir"/ 2>/dev/null || true
+  shopt -u dotglob
+else
+  log info "Dry-run: would move data from $mountpoint to $temp_dir"
+fi
+
+###############################################################################
+# 5. Remove the volume
+###############################################################################
+log info "Removing volume: $volume_name"
+if [ "$dry_run" = false ]; then
+  while docker volume inspect "$volume_name" &>/dev/null; do
+    if ! docker volume rm "$volume_name"; then
+      log error <<EOF
+Could not remove $volume_name.
+
+Are you sure you stopped and removed all the containers using it?
+
+If you're sure, forcibly remove the volume on your host machine with:
+
+  Docker:
+    docker volume rm "$volume_name" --force
+
+  Podman:
+    podman volume rm "$volume_name" --force
+
+I'll wait...
+EOF
+      read -rp "Press Enter after you have removed the volume manually..." _
+    else
+      log info "Volume $volume_name successfully removed."
+    fi
+  done
+else
+  log info "Dry-run: would remove volume $volume_name"
+fi
+
+###############################################################################
+# 6. Recreate the volume with the same configuration but new labels
+###############################################################################
+# Rebuild driver options if any exist
+driver_opts=()
+options_json=$(echo "$volume_info" | jq -r '.Options // {}')
+for key in $(echo "$options_json" | jq -r 'keys[]' 2>/dev/null || true); do
+  value=$(echo "$options_json" | jq -r --arg k "$key" '.[$k]')
+  driver_opts+=(--opt "$key=$value")
+done
+
+log info "Recreating volume: $volume_name with updated labels"
+create_cmd="docker volume create --name $volume_name --driver $driver"
+# Append any driver options and label options to the command
+for opt in "${driver_opts[@]}"; do
+  create_cmd+=" $opt"
+done
+for lab in "${label_opts[@]}"; do
+  create_cmd+=" $lab"
+done
+log debug "Volume create command: $create_cmd"
+if [ "$dry_run" = false ]; then
+  eval $create_cmd
+else
+  log info "Dry-run: would execute: $create_cmd"
+fi
+
+###############################################################################
+# 7. Move data back into the new volume mountpoint
+###############################################################################
+new_volume_info=$(docker volume inspect "$volume_name" --format '{{json .}}')
+new_mountpoint=$(echo "$new_volume_info" | jq -r '.Mountpoint')
+log info "Moving data back to new volume mountpoint: $new_mountpoint"
+if [ "$dry_run" = false ]; then
+  shopt -s dotglob nullglob  # Handle dotfiles
+  mv "$temp_dir"/* "$temp_dir"/.* "$new_mountpoint"/ 2>/dev/null || true
+  shopt -u dotglob  # Restore default behavior
+  rm -rf "$temp_dir"
+else
+  log info "Dry-run: would move data from $temp_dir to $new_mountpoint and remove $temp_dir"
+fi
+
+###############################################################################
+# 8. Instruct user to re-deploy containers as needed
+###############################################################################
+log info "The volume update is complete."
+log info "Please re-deploy any containers that were previously using the volume as needed."

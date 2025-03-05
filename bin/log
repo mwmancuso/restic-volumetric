@@ -1,0 +1,110 @@
+#!/bin/bash
+
+# Print all output to stderr
+exec 1>&2
+
+# Define log levels in order of severity
+declare -A LOG_LEVELS
+declare -A LOG_COLORS
+LOG_LEVELS=(
+  ["debug"]=0
+  ["info"]=1
+  ["warn"]=2
+  ["error"]=3
+)
+LOG_COLORS=(
+  ["debug"]="\033[1;34m" # Blue
+  ["info"]="\033[1;32m"  # Green
+  ["warn"]="\033[1;33m"  # Yellow
+  ["error"]="\033[1;31m" # Red
+)
+RESET_COLOR="\033[0m" # Reset to default
+
+# Function to print help
+print_help() {
+  cat <<EOF
+Usage: log <level> [message] [--process|-p <name>]
+Log messages with a specified level.
+
+Arguments:
+  <level>       Log level (debug, info, warn, error)
+  [message]     Message to log. If not provided, reads from stdin.
+
+Options:
+  --process, -p <name>  Override the script name in the log output.
+
+Environment Variables:
+  LOG_LEVEL     Minimum log level to display (default: info)
+
+Examples:
+  log info "This is an info message"
+  log error "This is an error message"
+  printf "Multiline\nMessage" | LOG_LEVEL=debug log debug --process "CustomProcess"
+EOF
+}
+
+# Parse options
+custom_process=""
+while [[ "$1" == --* || "$1" == -* ]]; do
+  case "$1" in
+    --process|-p)
+      custom_process=$2
+      shift 2
+      ;;
+    --help)
+      print_help
+      exit 0
+      ;;
+    *)
+      echo "[ERROR] Unknown option: $1"
+      print_help
+      exit 1
+      ;;
+  esac
+done
+
+# Log function
+level=$1; shift
+message="$*"
+
+# Check for no arguments
+if [[ -z "$level" ]]; then
+  print_help
+  exit 0
+fi
+
+# Read from stdin if no message is provided
+if [[ -z "$message" ]]; then
+  message=$(cat)
+fi
+
+# Get level value
+min_level=${LOG_LEVELS[${LOG_LEVEL:=info}]}
+current_level=${LOG_LEVELS[$level]}
+
+# Validate level
+if [[ -z "$current_level" ]]; then
+  echo "[ERROR] Invalid log level: $level"
+  print_help
+  exit 1
+fi
+
+# Only log messages at or above the current LOG_LEVEL
+if (( current_level >= min_level )); then
+  # Build the prefix
+  script_name=${custom_process:-$(cat /proc/$PPID/comm)}
+  timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+  color=${LOG_COLORS[$level]}
+  prefix=$(printf "${color}[%-5s] [%s] [%s] :${RESET_COLOR}" "${level^^}" "$timestamp" "$script_name")
+  prefix_length=${#prefix}
+
+  # Print the first line with the prefix
+  printf "%s %s\n" "$prefix" "$(echo "$message" | head -n1)"
+
+  # Print subsequent lines indented to match the prefix length
+  echo "$message" | tail -n +2 | while IFS= read -r line; do
+    printf "${color}[ ... ]${RESET_COLOR} %s\n" "$line"
+    # printf "%-${prefix_length}s %s\n" "" "$line"
+  done
+fi
+

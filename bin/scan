@@ -1,0 +1,176 @@
+#!/bin/bash
+
+set -euo pipefail
+
+node_name=""
+volumes=()
+backup_now=false
+
+# Function to print help
+print_help() {
+  cat <<EOF
+Usage: scan [--node node_name] [--backup-now] [volume...]
+Scans host for volumes with restic.backup.enabled=true and updates metadata.
+Enables crontab for each volume and schedules backups.
+If META_ENABLED=true, also backs up metadata to a separate repo.
+
+Arguments:
+  --node node_name  If provided, will backup to given node's metadata.
+                    Note: This will have no effect if either are set:
+                      - \$RESTIC_NODE_REPO_ROOT
+                      - \$RESTIC_NODE_META_REPO
+  --backup-now      Perform an immediate backup after scanning.
+  volume            Optional list of volume names to backup metadata for.
+                    If not provided, all volumes will be restored.
+EOF
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --help)
+      print_help
+      exit 0
+      ;;
+    --node)
+      node_name="$2"
+      shift 2
+      ;;
+    --backup-now)
+      backup_now=true
+      shift
+      ;;
+    *)
+      volumes+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [ -n "$node_name" ]; then
+  export NODE_NAME="$node_name"
+fi
+
+source restic-env
+
+# this script scans all docker volumes and if restic.backup.enabled=true,
+# it ensures the repo is initialized, and also refreshes local volume metadata
+# so that we can back that up in a separate meta repo if META_ENABLED=true
+
+# gather metadata for each volume that has restic.backup.enabled=true
+# (we might do them all, but let's only do "enabled" for sanity)
+
+meta_repo="$RESTIC_NODE_META_REPO"
+meta_path="$META_PATH"
+meta_vol_dir="$META_PATH/volumes"
+
+cron_root="/etc/cron.d"
+cron_update="$cron_root/cron.update"
+
+mkdir -p "$meta_vol_dir"
+
+if ! restic-cmd "$meta_repo" snapshots > /dev/null 2>&1; then
+  log info "  > Initializing meta repo $meta_repo at $meta_path ..."
+  restic-cmd "$meta_repo" init $INIT_ARGS
+fi
+
+log info "Scanning Docker volumes..."
+
+docker volume ls -q | while read -r vol; do
+  if [ ${#volumes[@]} -gt 0 ] && ! [[ " ${volumes[@]} " =~ " $vol " ]]; then
+    log debug "> Skipping volume: $vol"
+    continue
+  fi
+
+  log debug "> Analyzing volume: $vol"
+
+  meta_vol_path="$meta_vol_dir/$vol.json"
+
+  cron_name="volume-$vol"
+  cron_path="$cron_root/$cron_name"
+
+  info=$(docker volume inspect "$vol" --format json | jq '.[0]')
+  repo=$(get-volume-label "$info" restic.repo "$RESTIC_REPO_ROOT/$vol")
+  init_args=$(get-volume-label "$info" restic.init.args "$INIT_ARGS")
+  backup_enabled=$(get-volume-label "$info" restic.backup.enabled "$BACKUP_ENABLED")
+  backup_cron=$(get-volume-label "$info" restic.backup.cron "$BACKUP_CRON")
+  meta_enabled=$(get-volume-label "$info" restic.meta.enabled "$META_ENABLED")
+  password=$(get-volume-label "$info" restic.password "$RESTIC_PASSWORD")
+  password_file=$(get-volume-label "$info" restic.password.file "$RESTIC_PASSWORD_FILE")
+
+  if [ "$backup_enabled" = "true" ]; then
+    log debug " > Backup enabled for: $vol"
+    log debug "  > Using repo: $repo"
+
+    if [ "$backup_now" = "true" ]; then
+      log info "  > Running immediate backup for: $vol"
+      backup "$vol"
+    fi
+
+    # Enable crontab
+    log debug " > Scheduling cronjob at $cron_path with schedule: $backup_cron"
+    echo "$backup_cron backup $vol >>/app/cron.log 2>&1" > "$cron_path"
+    echo "$cron_name" >> "$cron_update"
+  else
+    log debug " > Backup disabled for: $vol"
+    continue
+  fi
+
+  if [ "$meta_enabled" = "true" ]; then
+    log debug " > Writing meta for $vol at $meta_vol_path"
+    echo "$info" > "$meta_vol_path"
+  else
+    log debug " > Meta disabled for: $vol"
+  fi
+done
+
+log debug "Pruning deleted volumes..."
+
+# Remove volumes which no longer exist
+shopt -s nullglob
+for file in "$meta_vol_dir"/*.json; do
+  # Extract the volume name from the file name
+  vol=$(basename "$file" .json)
+
+  cron_name="volume-$vol"
+  cron_path="$cron_root/$cron_name"
+
+  info=$(cat "$file")
+  backup_enabled=$(get-volume-label "$info" restic.backup.enabled "$BACKUP_ENABLED")
+  
+  # Check if the volume exists in Docker
+  if ! docker volume inspect "$vol" &>/dev/null || [ "$backup_enabled" != "true" ]; then
+    log warn "> Removing old volume meta: $vol"
+    rm -f "$file"
+    rm -f "$cron_path"
+    echo "$cron_name" >> "$cron_update"
+  fi
+done
+
+log info "Done scanning volumes..."
+
+# Backup meta
+if [ "$META_ENABLED" = "true" ]; then
+  meta_repo="$RESTIC_NODE_META_REPO"
+  meta_path="$META_PATH"
+  
+  log info "Backing up meta ..."
+  log info "> Using repo: $meta_repo"
+  log debug "> Backing up from: $meta_path"
+  
+  pushd "$meta_path" >/dev/null
+  if ! restic-cmd "$meta_repo" backup . $BACKUP_ARGS; then
+    log error "! Backup failed for meta. Aborting..."
+    exit 1
+  fi
+  popd >/dev/null
+  
+  if [ "$FORGET_ENABLED" = "true" ]; then
+    log info "> Forgetting old meta data"
+    log debug "> Forget args: $FORGET_ARGS"
+  
+    restic-cmd "$meta_repo" forget $FORGET_ARGS
+  fi
+
+  log info "Done backing up meta ..."
+fi

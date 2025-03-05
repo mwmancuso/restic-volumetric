@@ -1,0 +1,8 @@
+#!/bin/bash
+
+export info=$1; shift
+export label=$1; shift
+export default=$1; shift
+
+jq -r '.Labels[env.label] // env.default' <<< "$info"
+

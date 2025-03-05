@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+vol=""
+
+# Function to print help
+print_help() {
+  cat <<EOF
+Usage: backup [--node node_name] volume
+Backup script for Restic backups.
+
+Arguments:
+  volume            Name of volume to backup.
+EOF
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --help)
+      print_help
+      exit 0
+      ;;
+    *)
+      if [ -z "$vol" ]; then
+        vol="$1"
+      else
+        echo "Error: Only one volume can be backed up at a time" >&2
+        exit 1
+      fi
+      shift
+      ;;
+  esac
+done
+
+if [ -z "$vol" ]; then
+  echo "Error: Volume name is required" >&2
+  exit 1
+fi
+
+source restic-env
+
+info=$(docker volume inspect "$vol" --format json | jq '.[0]')
+mountpoint=$(jq -r '.Mountpoint' <<< "$info")
+repo=$(get-volume-label "$info" restic.repo "$RESTIC_REPO_ROOT/$vol")
+init_args=$(get-volume-label "$info" restic.init.args "$INIT_ARGS")
+backup_args=$(get-volume-label "$info" restic.backup.args "$BACKUP_ARGS")
+meta_enabled=$(get-volume-label "$info" restic.meta.enabled "$META_ENABLED")
+forget_enabled=$(get-volume-label "$info" restic.forget.enabled "$FORGET_ENABLED")
+forget_args=$(get-volume-label "$info" restic.forget.args "$FORGET_ARGS")
+password=$(get-volume-label "$info" restic.password "$RESTIC_PASSWORD")
+password_file=$(get-volume-label "$info" restic.password.file "$RESTIC_PASSWORD_FILE")
+
+# Backup volume
+log info "Backing up volume $vol ..."
+log info "> Using repo: $repo"
+log debug "> Backing up from: $mountpoint"
+
+# Initialize restic repo if needed
+(
+  RESTIC_PASSWORD="$password"
+  RESTIC_PASSWORD_FILE="$password_file"
+
+  if ! restic-cmd "$repo" snapshots > /dev/null 2>&1; then
+    log info "  > Initializing repo $repo for vol $vol ..."
+    restic-cmd "$repo" init $init_args
+  else
+    log debug "  > Repo already initialized"
+  fi
+)
+
+if [ -n "$( ls -A "$mountpoint" )" ]; then
+  pushd "$mountpoint" >/dev/null
+  (
+    RESTIC_PASSWORD="$password"
+    RESTIC_PASSWORD_FILE="$password_file"
+
+    if ! restic-cmd "$repo" backup . $backup_args; then
+      log error "! Backup failed for volume $vol. Aborting..."
+      exit 1
+    fi
+  )
+  popd >/dev/null
+else
+  log warn "> Volume is empty, not backing up..."
+fi
+
+if [ "$forget_enabled" = "true" ]; then
+  log info "> Forgetting old data"
+  log debug "> Forget args: $forget_args"
+
+  (
+    RESTIC_PASSWORD="$password"
+    RESTIC_PASSWORD_FILE="$password_file"
+
+    restic-cmd "$repo" forget $forget_args
+  )
+fi
+
+log info "Done backing up $vol ..."

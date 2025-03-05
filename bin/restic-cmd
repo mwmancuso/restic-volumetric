@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+
+set -eo pipefail
+
+repo="$1"; shift
+
+if [ -n "${RESTIC_PASSWORD_FILE}" ] && [ -f "$RESTIC_PASSWORD_FILE" ]; then
+  RESTIC_PASSWORD="" \
+    restic -r "$repo" --password-file "$RESTIC_PASSWORD_FILE" "$@" | log -p restic info
+else
+  RESTIC_PASSWORD="$RESTIC_PASSWORD" \
+    restic -r "$repo" "$@" | log -p restic info
+fi
+
